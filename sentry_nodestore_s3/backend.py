@@ -1,108 +1,132 @@
-from __future__ import absolute_import
+from __future__ import annotations
+
+from typing import Any, Mapping
+from datetime import datetime, timedelta
 
 import boto3
-from time import sleep
-from datetime import datetime, timedelta
-from typing import Any
+from botocore.config import Config
 
+from sentry.utils.codecs import Codec, ZstdCodec
 from sentry.nodestore.base import NodeStorage
 from sentry.nodestore.django import DjangoNodeStorage
 
 
-def retry(tries=3, delay=0.1, max_delay=None, backoff=1, exceptions=Exception):
-    """Retry Decorator with arguments
-    Args:
-        tries (int): The maximum number of attempts. Defaults to -1 (infinite)
-        delay (int, optional): Delay between attempts (seconds). Defaults to 0
-        max_delay (int, optional): The maximum value of delay (seconds). Defaults to None (Unlimited)
-        backoff (int, optional): Multiplier applied to delay between attempts (seconds). Defaults to 1 (No backoff)
-        exceptions (tuple, optional): Types of exceptions to catch. Defaults to Exception (all)
-    """
-
-    def retry_decorator(func):
-        def retry_wrapper(*args, **kwargs):
-            nonlocal tries, delay, max_delay, backoff, exceptions
-            while tries:
-                try:
-                    return func(*args, **kwargs)
-                except exceptions:
-                    tries -= 1
-
-                    # Reached to maximum tries
-                    if not tries:
-                        raise
-
-                    # Apply delay between requests
-                    sleep(delay)
-
-                    # Adjust the next delay according to backoff
-                    delay *= backoff
-
-                    # Adjust maximum delay duration
-                    if max_delay is not None:
-                        delay = min(delay, max_delay)
-
-        return retry_wrapper
-
-    return retry_decorator
-
-
 class S3PassthroughDjangoNodeStorage(DjangoNodeStorage, NodeStorage):
+    compression_strategies: Mapping[str, Codec[bytes, bytes]] = {
+        "zstd": ZstdCodec(),
+    }
+
     def __init__(
             self,
+            delete_through=False,
+            write_through=False,
+            read_through=False,
+            compression=True,
             bucket_name=None,
+            region_name=None,
+            bucket_path=None,
             endpoint_url=None,
+            retry_attempts=3,
             aws_access_key_id=None,
             aws_secret_access_key=None
     ):
+        self.delete_through = delete_through
+        self.write_through = write_through
+        self.read_through = read_through
+
+        if compression:
+            self.compression = "zstd"
+        else:
+            self.compression = None
+
         self.bucket_name = bucket_name
+        self.bucket_path = bucket_path
         self.client = boto3.client(
+            config=Config(
+                retries={
+                    'mode': 'standard',
+                    'max_attempts': retry_attempts,
+                }
+            ),
+            region_name=region_name,
             service_name='s3',
-            region_name='auto',
             endpoint_url=endpoint_url,
             aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key
+            aws_secret_access_key=aws_secret_access_key,
         )
 
     def delete(self, id):
-        super().delete(id)
+        if self.delete_through:
+            super().delete(id)
         self.__delete_from_bucket(id)
+        self._delete_cache_item(id)
 
     def _get_bytes(self, id: str) -> bytes | None:
-        return self.__read_from_bucket(id) or super()._get_bytes(id)
+        if self.read_through:
+            return self.__read_from_bucket(id) or super()._get_bytes(id)
+        return self.__read_from_bucket(id)
 
     def _get_bytes_multi(self, id_list: list[str]) -> dict[str, bytes | None]:
         return {id: self._get_bytes(id) for id in id_list}
 
     def delete_multi(self, id_list: list[str]) -> None:
-        super().delete_multi(id_list)
+        if self.delete_through:
+            super().delete_multi(id_list)
+        # TODO: Maybe we should use the bulk delete API of the S3 client instead
         for id in id_list:
             self.__delete_from_bucket(id)
+        self._delete_cache_items(id_list)
 
     def _set_bytes(self, id: str, data: Any, ttl: timedelta | None = None) -> None:
-        super()._set_bytes(id, data, ttl)
+        if self.write_through:
+            super()._set_bytes(id, data, ttl)
         self.__write_to_bucket(id, data)
 
     def cleanup(self, cutoff_timestamp: datetime) -> None:
-        super().cleanup(cutoff_timestamp)
-        # TODO: Setup cleanup on the bucket itself to automatically delete old objects
+        if self.delete_through:
+            super().cleanup(cutoff_timestamp)
 
-    def bootstrap(self) -> None:
-        super().bootstrap()
-        # TODO: Update the bucket policy to automatically delete old objects based on the retention of the instance
+    def __get_key_for_id(self, id: str) -> str:
+        if self.bucket_path is None:
+            return id
+        return self.bucket_path + '/' + id
 
-    @retry()
-    def __read_from_bucket(self, id: str):
+    def __read_from_bucket(self, id: str) -> bytes | None:
         try:
-            response = self.client.get_object(Bucket=self.bucket_name, Key=id)
-            return response['Body'].read()
+            obj = self.client.get_object(
+                Key=self.__get_key_for_id(id),
+                Bucket=self.bucket_name,
+            )
+
+            data = obj.get('Body').read()
+
+            codec = self.compression_strategies.get(obj.get('ContentEncoding'))
+
+            return codec.decode(data) if codec else data
         except self.client.exceptions.NoSuchKey:
             return None
 
-    @retry()
-    def __write_to_bucket(self, id: str, data: Any):
-        self.client.put_object(Bucket=self.bucket_name, Key=id, Body=data)
+    def __write_to_bucket(self, id: str, data: Any) -> None:
+        content_encoding = ''
 
-    @retry()
-    def __delete_from_bucket(self, id: str):
-        self.client.delete_object(Bucket=self.bucket_name, Key=id)
+        if self.compression is not None:
+            codec = self.compression_strategies[self.compression]
+            compressed_data = codec.encode(data)
+
+            # Check if compression is worth it, otherwise store the data uncompressed
+            if len(compressed_data) <= len(data):
+                data = compressed_data
+                content_encoding = self.compression
+
+        self.client.put_object(
+            Key=self.__get_key_for_id(id),
+            Body=data,
+            Bucket=self.bucket_name,
+            ContentEncoding=content_encoding,
+        )
+
+    def __delete_from_bucket(self, id: str) -> None:
+        self.client.delete_object(
+            Key=self.__get_key_for_id(id),
+            Bucket=self.bucket_name,
+        )
