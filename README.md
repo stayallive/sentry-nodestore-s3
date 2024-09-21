@@ -15,7 +15,7 @@ This work is inspired by the [sentry-nodestore-s3](https://github.com/ewdurbin/s
 ## Caveats
 
 - This extension is not officially supported by Sentry
-- The extension is tested up to Sentry 24.4.1 at this time
+- The extension is tested up to Sentry 24.9.0 at this time
 - This code is only tested with the [official self-hosted](https://github.com/getsentry/self-hosted) Sentry distribution and not with any third-party K8S or other flavors
 - At this time the extension is actively used in production but _no guarantees are made_ about it's functionality or performance (performance is also highly dependent on your object storage provider)
 
